@@ -13,6 +13,7 @@ from label_reader import IMAGE_SUFFIXES, build_ocr, scan_image
 ROOT = Path(__file__).resolve().parent
 RUNS = ROOT / "web_runs"
 app = Flask(__name__)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 _ocr = None
 
 
@@ -48,10 +49,21 @@ def scan():
             name = secure_filename(uploaded.filename) or f"image_{number}.jpg"
             source = upload_dir / name
             uploaded.save(source)
-            result, stem = scan_image(source, ocr, batch_dir), source.stem
+            enhance = request.form.get('enhance') == 'true'
+            original_ocr = request.form.get('original_ocr') == 'true'
+            result, stem = scan_image(source, ocr, batch_dir, enhance=enhance, original_ocr=original_ocr), source.stem
             item = {"file": uploaded.filename, "label_found": result.label_found, "label_angle": result.label_angle, "qr_content": result.qr_content, "ocr_text": result.ocr_text, "confidence": result.confidence, "error": result.error, "original_url": f"/runs/{batch}/uploads/{name}"}
             if result.label_found:
+                item.update(original_ocr=original_ocr, original_text=result.original_text, original_confidence=result.original_confidence)
+                item['ocr_input_url'] = f'/runs/{batch}/{stem}_ocr_input.png'
+                item.update(boundary_refined=result.boundary_refined, glare_ratio=result.glare_ratio,
+                            quality_warning=result.quality_warning, glare_url=f'/runs/{batch}/{stem}_glare.png')
+                item['correction_method'] = result.correction_method
                 item.update(label_url=f"/runs/{batch}/{stem}_label.jpg", rectified_url=f"/runs/{batch}/{stem}_rectified.jpg", annotated_url=f"/runs/{batch}/{stem}_annotated.jpg")
+                if enhance:
+                    item['enhancement_note'] = result.enhancement_note
+                    if (batch_dir / f'{stem}_enhanced.png').exists():
+                        item.update(enhanced_url=f'/runs/{batch}/{stem}_enhanced.png', enhanced_text=result.enhanced_text, enhanced_confidence=result.enhanced_confidence)
             payload.append(item)
     except Exception:
         shutil.rmtree(batch_dir, ignore_errors=True)
