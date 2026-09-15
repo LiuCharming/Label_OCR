@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local input samples and generated recognition artifacts
+pic/
+contact.jpg
+output*/
+angle_correction*/
+label_anchor*/
+ppocr*/
+smoke_test/
