@@ -1,5 +1,6 @@
 numpy>=1.24
 opencv-python>=4.8
+flask>=3.0
 paddleocr>=3.7
 paddlepaddle>=3.3
 # Optional fallback if PaddlePaddle is unavailable on the host:

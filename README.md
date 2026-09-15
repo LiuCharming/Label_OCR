@@ -55,6 +55,16 @@ python label_reader.py .\pic\902032100_20260914184505_f734.jpg --output .\smoke_
 
 成功后，终端会显示 `Scanned 1 image(s); located 1 label(s)`。检查 `smoke_test\results.json` 中的 `ocr_text`，应包含产品编码、批次号、数量与 PN 字段。
 
+## 浏览器测试页
+
+启动本地测试页：
+
+```powershell
+python app.py
+```
+
+浏览器打开 `http://127.0.0.1:5000`。可一次拖入多张图片；每张结果会按同一张图片展示定位框、原始标签裁图、二维码矫正图、二维码内容和 OCR 文字。上传与识别仅在本机完成。
+
 ## 依赖说明
 
 - `paddleocr` + `paddlepaddle`：默认 PP-OCRv4 Mobile 引擎
