@@ -77,6 +77,8 @@ python app.py
 
 ### 浅色笔画增强
 
+阈值轮廓失败时，尝试二维码引导的 GrabCut 分割（处理长边最多 600 像素，3 次迭代），并修整突出背景。测试页显示绿色分割轮廓，保存 `*_segmentation.png` 和 `*_mask.png` 供复核。此方法仍可能包含背景或裁掉边缘，应核对轮廓；模型置信度不等于文字准确率。
+
 测试页勾选「图像增强对照」可查看白底黑字增强图及独立 OCR 结果。先确认矫正图中的标签轮廓，遮盖轮廓外背景，再进行保边降噪、纸面光照校正和 Gamma=1.6 温和增强。边界无法确认时跳过增强，通过 `enhancement_note` 提示使用矫正后结果；不会按字符长度删除识别内容。命令行使用 `python label_reader.py .\pic --output .\output --enhance`。
 增强增加一次 OCR，默认关闭；结果保留 `ocr_text`，另存 `enhanced_text`、`enhanced_confidence` 和 `*_enhanced.png`。浅色短横线仍可能漏识别，增强不会按编码格式补写字符，请对照图片复核。
 

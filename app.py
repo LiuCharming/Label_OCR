@@ -63,6 +63,7 @@ def scan():
                 if enhance:
                     item['enhancement_note'] = result.enhancement_note
                     if (batch_dir / f'{stem}_enhanced.png').exists():
+                        item['segmentation_url'] = f'/runs/{batch}/{stem}_segmentation.png'
                         item.update(enhanced_url=f'/runs/{batch}/{stem}_enhanced.png', enhanced_text=result.enhanced_text, enhanced_confidence=result.enhanced_confidence)
             payload.append(item)
     except Exception:

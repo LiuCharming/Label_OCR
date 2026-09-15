@@ -392,6 +392,58 @@ def ocr_quality(text: str, confidence: float | None) -> float:
     return len([line for line in text.splitlines() if line.strip()]) * (confidence or 0)
 
 
+def grabcut_label_mask(image: np.ndarray) -> np.ndarray | None:
+    """Segment paper at bounded resolution using QR-relative foreground seeds."""
+    points = find_qr_points(image)
+    if points is None or len(points) != 4:
+        return None
+    scale = min(1., 600 / max(image.shape[:2]))
+    small = cv2.resize(image, None, fx=scale, fy=scale)
+    points = points.astype(np.float32)*scale
+    transform = cv2.getPerspectiveTransform(np.array([[0,0],[1,0],[1,1],[0,1]],np.float32), points)
+    def polygon(coords):
+        return np.round(cv2.perspectiveTransform(np.array([coords],np.float32), transform)[0]).astype(np.int32)
+    seeds = np.full(small.shape[:2], cv2.GC_PR_BGD, np.uint8)
+    cv2.fillConvexPoly(seeds, polygon([[-2.5,-.45],[1.65,-.45],[1.65,1.9],[-2.5,1.9]]), cv2.GC_PR_FGD)
+    # Interior ink and paper are both foreground; keep the seed well within
+    # the QR so different label layouts do not force background into the mask.
+    cv2.fillConvexPoly(seeds, polygon([[.1,.1],[.9,.1],[.9,.9],[.1,.9]]), cv2.GC_FGD)
+    seeds[:2,:] = cv2.GC_BGD; seeds[-2:,:] = cv2.GC_BGD
+    seeds[:,:2] = cv2.GC_BGD; seeds[:,-2:] = cv2.GC_BGD
+    try:
+        cv2.grabCut(small,seeds,None,np.zeros((1,65)),np.zeros((1,65)),3,cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return None
+    mask = np.isin(seeds,[cv2.GC_FGD,cv2.GC_PR_FGD]).astype(np.uint8)*255
+    mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
+    contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    center = tuple(points.mean(axis=0).astype(float))
+    candidates = [c for c in contours if cv2.pointPolygonTest(c,center,False)>=0]
+    if not candidates: return None
+    contour = max(candidates,key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    if not 2 < area/max(abs(cv2.contourArea(points)),1) < 20: return None
+    if area > .95*mask.size: return None
+    mask[:] = 0
+    cv2.drawContours(mask,[contour],-1,255,-1)
+    # Rectified labels are approximately horizontal. Trim narrow protrusions
+    # (e.g. reflective packaging) using robust boundary estimates across rows
+    # and columns rather than a convex hull that includes those protrusions.
+    ys, xs = np.nonzero(mask)
+    xlo,xhi = np.percentile(xs,[10,90]).astype(int)
+    ylo,yhi = np.percentile(ys,[10,90]).astype(int)
+    columns = [np.flatnonzero(mask[:,x]) for x in range(xlo,xhi+1)]
+    rows = [np.flatnonzero(mask[y,:]) for y in range(ylo,yhi+1)]
+    top = int(np.percentile([v[0] for v in columns if len(v)],75))
+    bottom = int(np.percentile([v[-1] for v in columns if len(v)],25))
+    left = int(np.percentile([v[0] for v in rows if len(v)],75))
+    right = int(np.percentile([v[-1] for v in rows if len(v)],25))
+    if np.all(points[:,0] >= left) and np.all(points[:,0] <= right) and np.all(points[:,1] >= top) and np.all(points[:,1] <= bottom):
+        mask[:top] = 0; mask[bottom+1:] = 0
+        mask[:,:left] = 0; mask[:,right+1:] = 0
+    return cv2.resize(mask,(image.shape[1],image.shape[0]),interpolation=cv2.INTER_NEAREST)
+
+
 def label_interior_mask(image: np.ndarray) -> np.ndarray | None:
     """Find the paper contour in the rectified image, anchored by the QR."""
     points = find_qr_points(image)
@@ -414,7 +466,7 @@ def label_interior_mask(image: np.ndarray) -> np.ndarray | None:
             if not (3 < area/max(qr_area,1) < 18 and 1.3 < w/h < 3.6 and area/(w*h) > .9): continue
             if x <= 1 or y <= 1 or x+w >= gray.shape[1]-1 or y+h >= gray.shape[0]-1: continue
             candidates.append((area/(w*h), contour))
-    if not candidates: return None
+    if not candidates: return grabcut_label_mask(image)
     mask = np.zeros(gray.shape, np.uint8)
     cv2.drawContours(mask, [max(candidates,key=lambda x:x[0])[1]], -1, 255, -1)
     mask = cv2.erode(mask, np.ones((3,3),np.uint8))
@@ -480,6 +532,11 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
         clean = mask_qr_for_ocr(rectified)
         enhanced = enhance_label(clean)
         enhanced[interior == 0] = 255
+        overlay = rectified.copy()
+        contours, _ = cv2.findContours(interior, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0,200,80), max(2,round(max(rectified.shape[:2])/400)))
+        cv2.imwrite(str(output_dir / f'{path.stem}_segmentation.png'), overlay)
+        cv2.imwrite(str(output_dir / f'{path.stem}_mask.png'), interior)
         result.enhancement_note = '仅增强标签内部：背景已遮盖，先降噪，再温和压暗笔画。'
         cv2.imwrite(str(output_dir / f"{path.stem}_enhanced.png"), enhanced)
         result.enhanced_text, result.enhanced_confidence = recognise_text(ocr, enhanced)
