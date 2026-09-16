@@ -43,6 +43,73 @@ class ScanResult:
     quality_warning: str = ""
 
 
+def segment_white_label(image: np.ndarray, qr_points: np.ndarray | None = None) -> np.ndarray | None:
+    """Find complete paper in the full photo, without a QR-relative size cap."""
+    scale = min(1., 1000 / max(image.shape[:2]))
+    small = cv2.resize(image, None, fx=scale, fy=scale)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
+    anchors = qr_points * scale if qr_points is not None else None
+    candidates = []
+    for brightness in (85, 110, 140, 170, 200):
+        for saturation in (30, 45, 55, 65, 80):
+            binary = ((gray >= brightness) & (hsv[:, :, 1] <= saturation) & (lab[:, :, 2] <= 130)).astype(np.uint8) * 255
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if not .001 < area / gray.size < .9:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                if x <= 1 or y <= 1 or x+w >= gray.shape[1]-1 or y+h >= gray.shape[0]-1:
+                    continue
+                rw, rh = cv2.minAreaRect(contour)[1]
+                if min(rw, rh) < 12 or max(rw, rh)/min(rw, rh) > 8:
+                    continue
+                fill = area / (rw * rh)
+                if fill < .86:
+                    continue
+                if anchors is not None and not all(cv2.pointPolygonTest(contour, tuple(p.astype(float)), False) >= 0 for p in anchors):
+                    continue
+                # Prefer complete rectangular regions across threshold levels.
+                candidates.append((area * fill**3, contour))
+    if not candidates:
+        return None
+    mask = np.zeros(gray.shape, np.uint8)
+    cv2.drawContours(mask, [max(candidates, key=lambda item: item[0])[1]], -1, 255, -1)
+    return cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+
+def rectify_paper(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rectify a convex paper quadrilateral; retain the actual segmentation mask."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(contour)
+    quad = cv2.approxPolyDP(hull, .025 * cv2.arcLength(hull, True), True)
+    if len(quad) != 4:
+        # Preserve all pixels if perspective corners are not reliable.
+        return image.copy(), mask.copy()
+    points = quad[:, 0].astype(np.float32)
+    center = points.mean(axis=0)
+    points = points[np.argsort(np.arctan2(points[:, 1]-center[1], points[:, 0]-center[0]))]
+    points = np.roll(points, -np.argmin(points.sum(axis=1)), axis=0)
+    widths = [np.linalg.norm(points[1]-points[0]), np.linalg.norm(points[2]-points[3])]
+    heights = [np.linalg.norm(points[3]-points[0]), np.linalg.norm(points[2]-points[1])]
+    w, h = max(2, round(max(widths))), max(2, round(max(heights)))
+    target = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], np.float32)
+    matrix = cv2.getPerspectiveTransform(points, target)
+    output = cv2.warpPerspective(image, matrix, (w,h), borderValue=(255,255,255))
+    interior = cv2.warpPerspective(mask, matrix, (w,h), flags=cv2.INTER_NEAREST)
+    angle = qr_rotation_angle(output)
+    if angle is not None:
+        turns = int(round(angle / 90)) % 4
+        output = np.ascontiguousarray(np.rot90(output, turns))
+        interior = np.ascontiguousarray(np.rot90(interior, turns))
+    output[interior == 0] = 255
+    return output, interior
+
+
 def refine_boundary(image: np.ndarray, box: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], bool]:
     """Find a compact white rectangle enclosing the QR within the coarse crop."""
     x, y, w, h = box
@@ -494,17 +561,27 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
     if image is None:
         return ScanResult(path.name, False, None, None, [], "", None, "Image could not be read")
     full_qr_points = find_qr_points(image)
-    box = find_label(image, full_qr_points)
+    paper_mask = segment_white_label(image, full_qr_points)
+    box = cv2.boundingRect(paper_mask) if paper_mask is not None else find_label(image, full_qr_points)
     if box is None:
         return ScanResult(path.name, False, None, None, decode_qr(image), "", None)
-    box, boundary_refined = refine_boundary(image, box)
+    # Never shrink a full-photo segmentation using the old small-label rules.
+    boundary_refined = paper_mask is not None
     x, y, w, h = box
     pad = max(6, round(max(w, h) * 0.025))
     x0, y0 = max(0, x - pad), max(0, y - pad)
     x1, y1 = min(image.shape[1], x + w + pad), min(image.shape[0], y + h + pad)
     crop = image[y0:y1, x0:x1]
     angle = qr_rotation_angle(crop)
-    rectified, correction_method = rectify_label(crop)
+    plane = crop.copy()
+    if paper_mask is not None:
+        plane[paper_mask[y0:y1, x0:x1] == 0] = 255
+    rectified_interior = None
+    if paper_mask is not None:
+        rectified, rectified_interior = rectify_paper(plane, paper_mask[y0:y1, x0:x1])
+        correction_method = "label_perspective"
+    else:
+        rectified, correction_method = rectify_label(plane)
     text, confidence = recognise_text(ocr, rectified)
     # Rotation normally improves tilted labels.  Keep a raw-crop fallback for
     # QR detections affected by strong perspective distortion.
@@ -525,7 +602,8 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
     glare_image, result.glare_ratio, result.quality_warning = inspect_glare(crop)
     cv2.imwrite(str(output_dir / f"{path.stem}_glare.png"), glare_image)
     if enhance:
-        interior = label_interior_mask(rectified)
+        # The full-photo mask already removed background before rectification.
+        interior = rectified_interior if rectified_interior is not None else label_interior_mask(rectified)
         if interior is None:
             result.enhancement_note = '未确认完整标签边界，已跳过增强。请使用矫正后识别结果。'
             return result
