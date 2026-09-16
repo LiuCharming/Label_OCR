@@ -75,13 +75,28 @@ def segment_white_label(image: np.ndarray, qr_points: np.ndarray | None = None) 
                 # Prefer complete rectangular regions across threshold levels.
                 candidates.append((area * fill**3, contour))
     if not candidates:
-        return None
+        # Reflections can connect to the paper in every brightness threshold.
+        # Colour segmentation is an independent fallback, never a blind crop.
+        mask = grabcut_label_mask(image)
+        if mask is None:
+            return None
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = max(contours, key=cv2.contourArea)
+        rw, rh = cv2.minAreaRect(contour)[1]
+        x, y, w, h = cv2.boundingRect(contour)
+        if min(rw, rh) <= 0 or cv2.contourArea(contour)/(rw*rh) < .86:
+            return None
+        if x <= 1 or y <= 1 or x+w >= image.shape[1]-1 or y+h >= image.shape[0]-1:
+            return None
+        if qr_points is not None and not all(cv2.pointPolygonTest(contour, tuple(p.astype(float)), False) >= 0 for p in qr_points):
+            return None
+        return mask
     mask = np.zeros(gray.shape, np.uint8)
     cv2.drawContours(mask, [max(candidates, key=lambda item: item[0])[1]], -1, 255, -1)
     return cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
 
 
-def rectify_paper(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def rectify_paper(image: np.ndarray, mask: np.ndarray, qr_points: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Rectify a convex paper quadrilateral; retain the actual segmentation mask."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour = max(contours, key=cv2.contourArea)
@@ -94,6 +109,8 @@ def rectify_paper(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.n
     center = points.mean(axis=0)
     points = points[np.argsort(np.arctan2(points[:, 1]-center[1], points[:, 0]-center[0]))]
     points = np.roll(points, -np.argmin(points.sum(axis=1)), axis=0)
+    # Rounded corners and low-resolution masks under-estimate paper edges.
+    points = center + (points - center) * 1.04
     widths = [np.linalg.norm(points[1]-points[0]), np.linalg.norm(points[2]-points[3])]
     heights = [np.linalg.norm(points[3]-points[0]), np.linalg.norm(points[2]-points[1])]
     w, h = max(2, round(max(widths))), max(2, round(max(heights)))
@@ -101,7 +118,14 @@ def rectify_paper(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.n
     matrix = cv2.getPerspectiveTransform(points, target)
     output = cv2.warpPerspective(image, matrix, (w,h), borderValue=(255,255,255))
     interior = cv2.warpPerspective(mask, matrix, (w,h), flags=cv2.INTER_NEAREST)
-    angle = qr_rotation_angle(output)
+    # Preserve the original corner correspondence through the homography.
+    # Re-detection after resampling can change the apparent QR orientation.
+    qr = qr_points if qr_points is not None else find_qr_points(image)
+    angle = None
+    if qr is not None and len(qr) == 4:
+        projected = cv2.perspectiveTransform(qr[None].astype(np.float32), matrix)[0]
+        vector = (projected[1]-projected[0]) + (projected[2]-projected[3])
+        angle = float(np.degrees(np.arctan2(vector[1], vector[0])))
     if angle is not None:
         turns = int(round(angle / 90)) % 4
         output = np.ascontiguousarray(np.rot90(output, turns))
@@ -282,6 +306,13 @@ def find_label(image: np.ndarray, qr_points: np.ndarray | None = None) -> tuple[
     qr_center = np.mean(qr_points, axis=0) * scale if qr_points is not None else None
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
+        # A reflection's bounding box can contain the QR centre while its
+        # actual contour excludes the code. Require all corners in the region.
+        if qr_points is not None and not all(
+            cv2.pointPolygonTest(contour, tuple(p.astype(float)), False) >= 0
+            for p in qr_points * scale
+        ):
+            continue
         area = w * h
         if area < image_area * 0.001 or area > image_area * 0.22:
             continue
@@ -309,10 +340,10 @@ def find_label(image: np.ndarray, qr_points: np.ndarray | None = None) -> tuple[
         # If thresholding did not join the white label into one contour (as on
         # the dark/shadowed sample), derive it directly from the QR geometry.
         if candidate is None:
-            return label_box_from_qr(qr_points, original_width, original_height)
+            return (0, 0, original_width, original_height)
         x, y, w, h = candidate
         if not (x <= qr_center[0] <= x + w and y <= qr_center[1] <= y + h):
-            return label_box_from_qr(qr_points, original_width, original_height)
+            return (0, 0, original_width, original_height)
     if candidate is None:
         return None
     x, y, w, h = candidate
@@ -459,7 +490,7 @@ def ocr_quality(text: str, confidence: float | None) -> float:
     return len([line for line in text.splitlines() if line.strip()]) * (confidence or 0)
 
 
-def grabcut_label_mask(image: np.ndarray) -> np.ndarray | None:
+def grabcut_label_mask(image: np.ndarray, trim_horizontal: bool = False) -> np.ndarray | None:
     """Segment paper at bounded resolution using QR-relative foreground seeds."""
     points = find_qr_points(image)
     if points is None or len(points) != 4:
@@ -493,6 +524,13 @@ def grabcut_label_mask(image: np.ndarray) -> np.ndarray | None:
     if area > .95*mask.size: return None
     mask[:] = 0
     cv2.drawContours(mask,[contour],-1,255,-1)
+    edge = points[1] - points[0]
+    edge_angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
+    # Axis-aligned labels may have narrow glare protrusions removed safely;
+    # oblique labels must never be cut by horizontal/vertical percentiles.
+    axis_aligned = abs((edge_angle + 45) % 90 - 45) < 8
+    if not trim_horizontal and not axis_aligned:
+        return cv2.resize(mask,(image.shape[1],image.shape[0]),interpolation=cv2.INTER_NEAREST)
     # Rectified labels are approximately horizontal. Trim narrow protrusions
     # (e.g. reflective packaging) using robust boundary estimates across rows
     # and columns rather than a convex hull that includes those protrusions.
@@ -533,7 +571,7 @@ def label_interior_mask(image: np.ndarray) -> np.ndarray | None:
             if not (3 < area/max(qr_area,1) < 18 and 1.3 < w/h < 3.6 and area/(w*h) > .9): continue
             if x <= 1 or y <= 1 or x+w >= gray.shape[1]-1 or y+h >= gray.shape[0]-1: continue
             candidates.append((area/(w*h), contour))
-    if not candidates: return grabcut_label_mask(image)
+    if not candidates: return grabcut_label_mask(image, trim_horizontal=True)
     mask = np.zeros(gray.shape, np.uint8)
     cv2.drawContours(mask, [max(candidates,key=lambda x:x[0])[1]], -1, 255, -1)
     mask = cv2.erode(mask, np.ones((3,3),np.uint8))
@@ -567,6 +605,7 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
         return ScanResult(path.name, False, None, None, decode_qr(image), "", None)
     # Never shrink a full-photo segmentation using the old small-label rules.
     boundary_refined = paper_mask is not None
+    full_image_fallback = paper_mask is None and box == (0, 0, image.shape[1], image.shape[0])
     x, y, w, h = box
     pad = max(6, round(max(w, h) * 0.025))
     x0, y0 = max(0, x - pad), max(0, y - pad)
@@ -575,11 +614,17 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
     angle = qr_rotation_angle(crop)
     plane = crop.copy()
     if paper_mask is not None:
+        # Keep a small safety band so ink near a segmentation edge survives.
+        margin = max(3, round(min(w, h) * .025))
+        paper_mask = cv2.dilate(paper_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*margin+1, 2*margin+1)))
         plane[paper_mask[y0:y1, x0:x1] == 0] = 255
     rectified_interior = None
     if paper_mask is not None:
-        rectified, rectified_interior = rectify_paper(plane, paper_mask[y0:y1, x0:x1])
+        local_qr = full_qr_points - np.array([x0, y0], np.float32) if full_qr_points is not None else None
+        rectified, rectified_interior = rectify_paper(plane, paper_mask[y0:y1, x0:x1], local_qr)
         correction_method = "label_perspective"
+    elif full_image_fallback:
+        rectified, correction_method = plane, "none"
     else:
         rectified, correction_method = rectify_label(plane)
     text, confidence = recognise_text(ocr, rectified)
@@ -595,12 +640,16 @@ def scan_image(path: Path, ocr: Any | None, output_dir: Path, enhance: bool = Fa
     cv2.imwrite(str(output_dir / f"{path.stem}_rectified.jpg"), rectified)
     cv2.imwrite(str(output_dir / f"{path.stem}_ocr_input.png"), mask_qr_for_ocr(rectified))
     cv2.imwrite(str(output_dir / f"{path.stem}_annotated.jpg"), annotated)
-    result = ScanResult(path.name, True, [x0, y0, x1 - x0, y1 - y0], angle, qr, text, confidence)
+    result = ScanResult(path.name, not full_image_fallback, [x0, y0, x1 - x0, y1 - y0], angle, qr, text, confidence)
     result.original_text, result.original_confidence = raw_text, raw_confidence
     result.correction_method = correction_method
     result.boundary_refined = boundary_refined
     glare_image, result.glare_ratio, result.quality_warning = inspect_glare(crop)
     cv2.imwrite(str(output_dir / f"{path.stem}_glare.png"), glare_image)
+    if full_image_fallback:
+        result.error = '未确认标签边界，已保留整图识别，未裁剪或增强。'
+        result.enhancement_note = result.error
+        return result
     if enhance:
         # The full-photo mask already removed background before rectification.
         interior = rectified_interior if rectified_interior is not None else label_interior_mask(rectified)
